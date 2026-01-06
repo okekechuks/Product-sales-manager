@@ -1,0 +1,19 @@
+/* Minimal styles to satisfy Vite import. */
+html, body, #root {
+  height: 100%;
+}
+body {
+  margin: 0;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  background: #F9FAFB;
+  color: #0f172a;
+}
+
+/* Note: this project uses Tailwind class names in components. To get full styling,
+   install and configure Tailwind and replace this file with Tailwind's directives:
+
+   @tailwind base;
+   @tailwind components;
+   @tailwind utilities;
+
+*/
