@@ -20,7 +20,9 @@ import {
   Inbox,
   ChevronLeft,
   ChevronRight,
-  Download
+  Download,
+  Search,
+  Pencil
 } from 'lucide-react';
 
 // --- Types & Constants ---
@@ -51,6 +53,7 @@ interface Sale {
   totalPrice: number;
   paymentAmount: number;
   timestamp: number;
+  receiptReceivedAt?: string;
 }
 
 type IconType = React.ComponentType<any>;
@@ -257,7 +260,19 @@ export default function App() {
           {view === 'dashboard' && <Dashboard analytics={analytics} sales={sales} />}
           {view === 'inventory' && <Inventory products={products} setProducts={setProducts} />}
           {view === 'payments' && <PaymentPortal products={products} onComplete={processSale} onNotify={notify} />}
-          {view === 'history' && <HistoryTable sales={sales} />}
+          {view === 'history' && (
+            <HistoryTable
+              sales={sales}
+              onUpdateSale={(id, updates) =>
+                setSales(prev =>
+                  prev.map(s => (s.id === id ? { ...s, ...updates } : s))
+                )
+              }
+              onDeleteSale={id =>
+                setSales(prev => prev.filter(s => s.id !== id))
+              }
+            />
+          )}
         </div>
       </main>
 
@@ -447,6 +462,8 @@ function Inventory({ products, setProducts }: { products: Product[]; setProducts
 function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]; onComplete: (s: Omit<Sale, 'id' | 'timestamp'>) => void; onNotify: (m: string) => void; }) {
   const [customer, setCustomer] = useState({ name: '', phone: '' });
   const [cart, setCart] = useState<Record<string, number>>({});
+  const [receiptReceivedAt, setReceiptReceivedAt] = useState<string>('');
+  const [amountPaid, setAmountPaid] = useState<string>('');
 
   const total = useMemo(() => {
     return Object.entries(cart).reduce((sum, [id, qty]) => {
@@ -478,6 +495,16 @@ function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]
       onNotify('Provide customer name and select items');
       return;
     }
+
+    const payment = Number(amountPaid);
+    if (!amountPaid || isNaN(payment) || payment <= 0) {
+      onNotify('Enter a valid amount paid');
+      return;
+    }
+    if (payment > total) {
+      onNotify('Amount paid cannot be more than total due');
+      return;
+    }
     // Validate stock again
     const insufficient = Object.entries(cart).find(([id, qty]) => {
       const p = products.find((prod) => prod.id === id);
@@ -492,7 +519,8 @@ function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]
       customerName: customer.name,
       customerPhone: customer.phone,
       totalPrice: total,
-      paymentAmount: total,
+      paymentAmount: payment,
+      receiptReceivedAt,
       items: Object.entries(cart).map(([id, qty]) => {
         const p = products.find((prod) => prod.id === id)!;
         return { productId: id, productName: p.name, quantity: qty, unitPrice: p.price, category: p.category };
@@ -500,6 +528,8 @@ function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]
     });
     setCart({});
     setCustomer({ name: '', phone: '' });
+    setAmountPaid('');
+    setReceiptReceivedAt('');
   };
 
   return (
@@ -532,7 +562,29 @@ function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]
           <div className="space-y-4">
             <input value={customer.name} onChange={e => setCustomer({...customer, name: e.target.value})} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none" placeholder="Customer Name" />
             <input value={customer.phone} onChange={e => setCustomer({...customer, phone: e.target.value})} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none" placeholder="Phone Number" />
-            
+
+            <div className="space-y-2">
+              <label className="text-[11px] font-bold text-slate-500 uppercase">Receipt Collection Date</label>
+              <input
+                type="date"
+                value={receiptReceivedAt}
+                onChange={e => setReceiptReceivedAt(e.target.value)}
+                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none text-sm"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-[11px] font-bold text-slate-500 uppercase">Amount Paid</label>
+              <input
+                type="number"
+                min={0}
+                value={amountPaid}
+                onChange={e => setAmountPaid(e.target.value)}
+                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+                placeholder="Enter amount received"
+              />
+            </div>
+
             <div className="pt-4 border-t border-slate-100 flex justify-between items-center">
               <span className="text-xs font-bold text-slate-400 uppercase">Total Due</span>
               <span className="text-xl font-black text-indigo-700">{formatNaira(total)}</span>
@@ -547,9 +599,130 @@ function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]
   );
 }
 
-function HistoryTable({ sales }: { sales: Sale[] }) {
+function HistoryTable({
+  sales,
+  onUpdateSale,
+}: {
+  sales: Sale[];
+  onUpdateSale: (id: string, updates: Partial<Sale>) => void;
+  onDeleteSale: (id: string) => void;
+}) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState<{
+    customerName: string;
+    customerPhone: string;
+    paymentAmount: string;
+    receiptReceivedAt?: string;
+  } | null>(null);
+  const [searchInput, setSearchInput] = useState<string>('');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [sortOption, setSortOption] = useState<
+    'date_desc' | 'date_asc' | 'amount_desc' | 'amount_asc' | 'receipt_desc' | 'receipt_asc'
+  >('date_desc');
+
+  const startEdit = (sale: Sale) => {
+    setEditingId(sale.id);
+    setDraft({
+      customerName: sale.customerName,
+      customerPhone: sale.customerPhone,
+      paymentAmount: String(sale.paymentAmount),
+      receiptReceivedAt: sale.receiptReceivedAt ?? '',
+    });
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setDraft(null);
+  };
+
+  const saveEdit = (id: string) => {
+    if (!draft) return;
+    const amount = Number(draft.paymentAmount);
+    if (isNaN(amount) || amount <= 0) {
+      alert('Enter a valid amount'); // uses built-in alert for simplicity
+      return;
+    }
+    onUpdateSale(id, {
+      customerName: draft.customerName,
+      customerPhone: draft.customerPhone,
+      paymentAmount: amount,
+      receiptReceivedAt: draft.receiptReceivedAt,
+    });
+    setEditingId(null);
+    setDraft(null);
+  };
+
+  const filteredAndSorted = [...sales]
+    .filter(s =>
+      !searchQuery
+        ? true
+        : s.customerName.toLowerCase().includes(searchQuery.toLowerCase())
+    )
+    .sort((a, b) => {
+      switch (sortOption) {
+        case 'date_asc':
+          return a.timestamp - b.timestamp;
+        case 'date_desc':
+          return b.timestamp - a.timestamp;
+        case 'amount_asc':
+          return a.paymentAmount - b.paymentAmount;
+        case 'amount_desc':
+          return b.paymentAmount - a.paymentAmount;
+        case 'receipt_asc': {
+          // Compare by calendar month (Jan–Dec), ignoring year
+          const ma = parseInt((a.receiptReceivedAt ?? '').slice(5, 7) || '0', 10);
+          const mb = parseInt((b.receiptReceivedAt ?? '').slice(5, 7) || '0', 10);
+          return ma - mb;
+        }
+        case 'receipt_desc': {
+          const ma = parseInt((a.receiptReceivedAt ?? '').slice(5, 7) || '0', 10);
+          const mb = parseInt((b.receiptReceivedAt ?? '').slice(5, 7) || '0', 10);
+          return mb - ma;
+        }
+        default:
+          return 0;
+      }
+    });
+
   return (
     <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden">
+      <div className="px-8 pt-6 pb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between border-b border-slate-100">
+        <div className="flex items-center gap-2 w-full sm:w-auto">
+          <div className="relative flex-1">
+            <input
+              type="text"
+              placeholder="Search customer name"
+              value={searchInput}
+              onChange={e => setSearchInput(e.target.value)}
+              className="w-full pl-9 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-full text-sm outline-none"
+            />
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          </div>
+          <button
+            type="button"
+            onClick={() => setSearchQuery(searchInput.trim())}
+            className="px-3 py-2 rounded-full bg-slate-900 text-white text-xs font-bold"
+          >
+            Search
+          </button>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] uppercase font-bold text-slate-400">Sort by</span>
+          <select
+            value={sortOption}
+            onChange={e => setSortOption(e.target.value as typeof sortOption)}
+            className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-full text-xs font-bold"
+          >
+            <option value="date_desc">Newest first</option>
+            <option value="date_asc">Oldest first</option>
+            <option value="amount_desc">Amount (High–Low)</option>
+            <option value="amount_asc">Amount (Low–High)</option>
+            <option value="receipt_desc">Receipt date (Newest)</option>
+            <option value="receipt_asc">Receipt date (Oldest)</option>
+          </select>
+        </div>
+      </div>
+
       <table className="w-full text-left">
         <thead className="bg-slate-50 text-[10px] font-black text-slate-400 uppercase border-b">
           <tr>
@@ -557,29 +730,129 @@ function HistoryTable({ sales }: { sales: Sale[] }) {
             <th className="px-8 py-5">Customer</th>
             <th className="px-8 py-5">Items Sold</th>
             <th className="px-8 py-5 text-right">Amount</th>
+            <th className="px-8 py-5 text-right"></th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-50">
-          {sales.map(s => (
-            <tr key={s.id} className="text-sm">
-              <td className="px-8 py-5">
-                <p className="font-bold text-slate-900">{new Date(s.timestamp).toLocaleDateString()}</p>
-                <p className="text-[10px] text-slate-400 font-mono uppercase">{s.id}</p>
-              </td>
-              <td className="px-8 py-5">
-                <p className="font-bold">{s.customerName}</p>
-                <p className="text-[10px] text-slate-400 font-bold">{s.customerPhone}</p>
-              </td>
-              <td className="px-8 py-5">
-                 <div className="flex flex-wrap gap-1">
-                   {s.items.map((it, idx) => (
-                     <span key={idx} className="text-[9px] px-2 py-0.5 bg-slate-50 rounded border border-slate-100 font-bold uppercase">{it.quantity}x {it.productName}</span>
-                   ))}
-                 </div>
-              </td>
-              <td className="px-8 py-5 text-right font-black">{formatNaira(s.paymentAmount)}</td>
-            </tr>
-          ))}
+          {filteredAndSorted.map(s => {
+            const isEditing = editingId === s.id;
+            return (
+              <tr key={s.id} className="text-sm">
+                <td className="px-8 py-5 align-top">
+                  <p className="font-bold text-slate-900">{new Date(s.timestamp).toLocaleDateString()}</p>
+                  <p className="text-[10px] text-slate-400 font-mono uppercase">{s.id}</p>
+                  {s.receiptReceivedAt && (
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Receipt: {s.receiptReceivedAt}
+                    </p>
+                  )}
+                </td>
+                <td className="px-8 py-5 align-top">
+                  {isEditing && draft ? (
+                    <div className="space-y-2">
+                      <input
+                        className="w-full px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs"
+                        value={draft.customerName}
+                        onChange={e =>
+                          setDraft(prev =>
+                            prev ? { ...prev, customerName: e.target.value } : prev
+                          )
+                        }
+                      />
+                      <input
+                        className="w-full px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs"
+                        value={draft.customerPhone}
+                        onChange={e =>
+                          setDraft(prev =>
+                            prev ? { ...prev, customerPhone: e.target.value } : prev
+                          )
+                        }
+                      />
+                    </div>
+                  ) : (
+                    <>
+                      <p className="font-bold">{s.customerName}</p>
+                      <p className="text-[10px] text-slate-400 font-bold">
+                        {s.customerPhone}
+                      </p>
+                    </>
+                  )}
+                </td>
+                <td className="px-8 py-5 align-top">
+                  <div className="flex flex-wrap gap-1">
+                    {s.items.map((it, idx) => (
+                      <span
+                        key={idx}
+                        className="text-[9px] px-2 py-0.5 bg-slate-50 rounded border border-slate-100 font-bold uppercase"
+                      >
+                        {it.quantity}x {it.productName}
+                      </span>
+                    ))}
+                  </div>
+                </td>
+                <td className="px-8 py-5 text-right font-black align-top">
+                  {isEditing && draft ? (
+                    <input
+                      type="number"
+                      className="w-28 px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs text-right"
+                      value={draft.paymentAmount}
+                      onChange={e =>
+                        setDraft(prev =>
+                          prev ? { ...prev, paymentAmount: e.target.value } : prev
+                        )
+                      }
+                    />
+                  ) : (
+                    formatNaira(s.paymentAmount)
+                  )}
+                </td>
+                <td className="px-8 py-5 text-right align-top">
+                  {isEditing ? (
+                    <div className="flex gap-2 justify-end text-xs">
+                      <button
+                        type="button"
+                        onClick={() => saveEdit(s.id)}
+                        className="p-2 rounded-full bg-emerald-600 text-white"
+                        title="Save"
+                      >
+                        <Check size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={cancelEdit}
+                        className="p-2 rounded-full bg-slate-100 text-slate-600"
+                        title="Cancel"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="flex gap-2 justify-end">
+                      <button
+                        type="button"
+                        onClick={() => startEdit(s)}
+                        className="p-2 rounded-full bg-slate-100 text-slate-600 hover:bg-slate-200"
+                        title="Edit"
+                      >
+                        <Pencil size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!confirm('Delete this record?')) return;
+                          onDeleteSale(s.id);
+                        }}
+                        className="p-2 rounded-full bg-rose-50 text-rose-600 hover:bg-rose-100"
+                        title="Delete"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
           {sales.length === 0 && (
              <tr><td colSpan={4} className="py-20 text-center text-slate-400">No records found</td></tr>
           )}
