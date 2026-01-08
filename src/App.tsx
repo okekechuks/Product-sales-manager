@@ -56,6 +56,17 @@ interface Sale {
   receiptReceivedAt?: string;
 }
 
+interface DamageRecord {
+  id: string;
+  productId: string;
+  productName: string;
+  quantity: number;
+  unitPrice: number;
+  type: 'Damaged' | 'Stolen';
+  note?: string | undefined;
+  timestamp: number;
+}
+
 type IconType = React.ComponentType<any>;
 
 const CATEGORY_MAP: Record<DeviceCategory, { icon: IconType; color: string; hex: string }> = {
@@ -83,8 +94,12 @@ export default function App() {
   const [view, setView] = useState<'dashboard' | 'inventory' | 'payments' | 'history'>('dashboard');
   const [products, setProducts] = useState<Product[]>([]);
   const [sales, setSales] = useState<Sale[]>([]);
+  const [damages, setDamages] = useState<DamageRecord[]>([]);
+  const [hydrated, setHydrated] = useState(false);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const [exportMonth, setExportMonth] = useState<string>('');
   const [notification, setNotification] = useState<string | null>(null);
 
   // Persistence logic
@@ -95,15 +110,18 @@ export default function App() {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed.products)) setProducts(parsed.products);
         if (Array.isArray(parsed.sales)) setSales(parsed.sales);
+        if (Array.isArray(parsed.damages)) setDamages(parsed.damages);
       } catch (e) {
         console.error('Failed to load local data', e);
       }
     }
+    setHydrated(true);
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ products, sales }));
-  }, [products, sales]);
+    if (!hydrated) return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ products, sales, damages }));
+  }, [products, sales, damages, hydrated]);
 
   const notify = (msg: string) => {
     setNotification(msg);
@@ -112,7 +130,8 @@ export default function App() {
 
   // Analytics derived from state
   const analytics = useMemo(() => {
-    const totalRevenue = sales.reduce((acc, sale) => acc + sale.paymentAmount, 0);
+    const damageLoss = damages.reduce((acc, d) => acc + d.unitPrice * d.quantity, 0);
+    const totalRevenue = sales.reduce((acc, sale) => acc + sale.paymentAmount, 0) - damageLoss;
     const stockValue = products.reduce((acc, p) => acc + p.price * p.stock, 0);
 
     const categoryDistribution: Record<string, number> = {};
@@ -129,8 +148,8 @@ export default function App() {
       color: CATEGORY_MAP[(label as DeviceCategory)]?.hex || '#64748b'
     }));
 
-    return { totalRevenue, totalSales: sales.length, stockValue, chartData };
-  }, [sales, products]);
+    return { totalRevenue, totalSales: sales.length, stockValue, chartData, damageLoss };
+  }, [sales, products, damages]);
 
   // Actions
   const addProduct = (e: React.FormEvent<HTMLFormElement>) => {
@@ -180,32 +199,270 @@ export default function App() {
     notify(`Transaction ${newSale.id} completed`);
   };
 
-  const exportCSV = () => {
-    if (sales.length === 0) return notify('No records to export');
-    const headers = ['ID', 'Date', 'Customer', 'Phone', 'Items', 'Amount'];
-    const rows = sales.map((s) => [
-      s.id,
-      new Date(s.timestamp).toLocaleDateString(),
-      s.customerName,
-      s.customerPhone,
-      s.items.map((i) => `${i.quantity}x ${i.productName}`).join('; '),
-      s.paymentAmount
-    ]);
+  const recordDamage = (payload: { productId: string; quantity: number; type: DamageRecord['type']; note?: string }) => {
+    const product = products.find((p) => p.id === payload.productId);
+    if (!product) {
+      notify('Product not found');
+      return;
+    }
+    if (payload.quantity <= 0) {
+      notify('Quantity must be greater than zero');
+      return;
+    }
+    if (product.stock < payload.quantity) {
+      notify('Cannot log more than available stock');
+      return;
+    }
 
-    const csv = [headers, ...rows]
-      .map((r) => r.map((c) => escapeCSV(c)).join(','))
-      .join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `Sales_Report_${new Date().toISOString().split('T')[0]}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    // revoke after use
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    notify('CSV Export Started');
+    const record: DamageRecord = {
+      id: `DMG-${Math.random().toString(36).substring(2, 9).toUpperCase()}`,
+      productId: product.id,
+      productName: product.name,
+      quantity: payload.quantity,
+      unitPrice: product.price,
+      type: payload.type,
+      note: payload.note?.trim() || undefined,
+      timestamp: Date.now()
+    };
+
+    setDamages((prev) => [record, ...prev]);
+    setProducts((prev) =>
+      prev.map((p) => (p.id === product.id ? { ...p, stock: Math.max(0, p.stock - payload.quantity) } : p))
+    );
+    notify(`${payload.type} logged for ${product.name}`);
+  };
+
+  const deleteDamage = (damageId: string) => {
+    const damage = damages.find((d) => d.id === damageId);
+    if (!damage) {
+      notify('Damage record not found');
+      return;
+    }
+
+    // Restore stock when deleting damage record
+    setProducts((prev) =>
+      prev.map((p) => (p.id === damage.productId ? { ...p, stock: p.stock + damage.quantity } : p))
+    );
+
+    setDamages((prev) => prev.filter((d) => d.id !== damageId));
+    notify(`Damage record deleted, stock restored for ${damage.productName}`);
+  };
+
+  const exportCSV = async (monthFilter?: string) => {
+    if (sales.length === 0 && damages.length === 0) return notify('No records to export');
+    
+    try {
+      // Import xlsx-js-style dynamically - use namespace import
+      const XLSXModule: any = await import('xlsx-js-style');
+      
+      // Try different ways to access the library
+      let XLSX = XLSXModule;
+      if (typeof XLSXModule === 'object') {
+        // Check for default export
+        if (XLSXModule.default && XLSXModule.default.utils) {
+          XLSX = XLSXModule.default;
+        }
+        // Check if utils is directly on the module
+        else if (XLSXModule.utils) {
+          XLSX = XLSXModule;
+        }
+      }
+      
+      if (!XLSX || !XLSX.utils || !XLSX.utils.book_new) {
+        console.error('XLSX module keys:', Object.keys(XLSXModule));
+        console.error('XLSX structure:', XLSX);
+        throw new Error(`XLSX library not loaded - utils: ${!!XLSX?.utils}, book_new: ${!!XLSX?.utils?.book_new}`);
+      }
+      
+      // Filter by month if provided
+      let filteredSales = sales;
+      let filteredDamages = damages;
+      
+      if (monthFilter) {
+        console.log('=== EXPORT DEBUG ===');
+        console.log('Month filter:', monthFilter);
+        console.log('Total sales:', sales.length);
+        console.log('Total damages:', damages.length);
+        
+        // Get all unique year-months from sales (using receiptReceivedAt if available)
+        const allYearMonths = new Set<string>();
+        sales.forEach((s) => {
+          let date: Date;
+          if (s.receiptReceivedAt) {
+            date = new Date(s.receiptReceivedAt);
+          } else {
+            date = new Date(s.timestamp);
+          }
+          const yearMonth = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+          allYearMonths.add(yearMonth);
+        });
+        damages.forEach((d) => {
+          const date = new Date(d.timestamp);
+          const yearMonth = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+          allYearMonths.add(yearMonth);
+        });
+        console.log('Available year-months in data:', Array.from(allYearMonths).sort());
+        
+        // Show sample dates
+        if (sales.length > 0) {
+          const sampleSale = sales[0];
+          const sampleDate = sampleSale.receiptReceivedAt 
+            ? new Date(sampleSale.receiptReceivedAt)
+            : new Date(sampleSale.timestamp);
+          const sampleYearMonth = `${sampleDate.getFullYear()}-${String(sampleDate.getMonth() + 1).padStart(2, '0')}`;
+          console.log('Sample sale timestamp:', sampleSale.timestamp);
+          console.log('Sample sale receiptReceivedAt:', sampleSale.receiptReceivedAt);
+          console.log('Sample sale date used:', sampleDate.toISOString());
+          console.log('Sample sale year-month:', sampleYearMonth);
+        }
+        
+        // Compare year-month strings directly to avoid timezone issues
+        // For sales, use receiptReceivedAt if available, otherwise use timestamp
+        filteredSales = sales.filter((s) => {
+          let date: Date;
+          if (s.receiptReceivedAt) {
+            // receiptReceivedAt is in YYYY-MM-DD format
+            date = new Date(s.receiptReceivedAt);
+          } else {
+            date = new Date(s.timestamp);
+          }
+          const recordYearMonth = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+          const matches = recordYearMonth === monthFilter;
+          if (matches) {
+            console.log(`✓ Matched sale: ${s.id}, Date: ${date.toISOString()}, Year-Month: ${recordYearMonth}`);
+          }
+          return matches;
+        });
+        
+        filteredDamages = damages.filter((d) => {
+          const date = new Date(d.timestamp);
+          const recordYearMonth = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+          const matches = recordYearMonth === monthFilter;
+          if (matches) {
+            console.log(`✓ Matched damage: ${d.id}, Date: ${date.toISOString()}, Year-Month: ${recordYearMonth}`);
+          }
+          return matches;
+        });
+        
+        console.log('Filtered sales count:', filteredSales.length);
+        console.log('Filtered damages count:', filteredDamages.length);
+        console.log('===================');
+        
+        if (filteredSales.length === 0 && filteredDamages.length === 0) {
+          return notify(`No records found for ${monthFilter}. Check console for details.`);
+        }
+      }
+      
+      const headers = ['Type', 'Date', 'Customer', 'Phone', 'Items', 'Amount'];
+      
+      // Prepare sales data with isSale flag
+      // Use receiptReceivedAt date if available, otherwise use timestamp
+      const salesData = filteredSales.map((s) => ({
+        Type: 'Sale',
+        Date: s.receiptReceivedAt 
+          ? new Date(s.receiptReceivedAt).toLocaleDateString()
+          : new Date(s.timestamp).toLocaleDateString(),
+        Customer: s.customerName,
+        Phone: s.customerPhone,
+        Items: s.items.map((i) => `${i.quantity}x ${i.productName}`).join('; '),
+        Amount: s.paymentAmount,
+        isSale: true
+      }));
+
+      // Prepare damages data with isSale flag
+      const damagesData = filteredDamages.map((d) => ({
+        Type: d.type,
+        Date: new Date(d.timestamp).toLocaleDateString(),
+        Customer: '-',
+        Phone: '-',
+        Items: `${d.quantity}x ${d.productName}${d.note ? ` (${d.note})` : ''}`,
+        Amount: -(d.unitPrice * d.quantity), // Negative to show as expense
+        isSale: false
+      }));
+
+      // Combine and sort by date (newest first)
+      const allData = [...salesData, ...damagesData].sort((a, b) => {
+        const dateA = new Date(a.Date).getTime();
+        const dateB = new Date(b.Date).getTime();
+        return dateB - dateA;
+      });
+
+      // Create workbook and worksheet
+      const wb = XLSX.utils.book_new();
+      const dataWithoutFlags = allData.map(({ isSale, ...row }) => row);
+      const ws = XLSX.utils.json_to_sheet(dataWithoutFlags);
+
+      // Define styles
+      const greenStyle = {
+        fill: { fgColor: { rgb: 'C6EFCE' } }, // Light green
+        font: { color: { rgb: '000000' } } // Black text
+      };
+      const redStyle = {
+        fill: { fgColor: { rgb: 'FFC7CE' } }, // Light red
+        font: { color: { rgb: '000000' } } // Black text
+      };
+
+      // Apply styles to rows
+      const range = XLSX.utils.decode_range(ws['!ref'] || 'A1');
+      for (let R = 1; R <= range.e.r; R++) {
+        const rowData = allData[R - 1];
+        const style = rowData.isSale ? greenStyle : redStyle;
+        
+        for (let C = range.s.c; C <= range.e.c; C++) {
+          const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
+          if (!ws[cellAddress]) continue;
+          ws[cellAddress].s = style;
+        }
+      }
+
+      // Style header row
+      for (let C = range.s.c; C <= range.e.c; C++) {
+        const cellAddress = XLSX.utils.encode_cell({ r: 0, c: C });
+        if (ws[cellAddress]) {
+          ws[cellAddress].s = {
+            font: { bold: true },
+            fill: { fgColor: { rgb: 'D9E1F2' } } // Light blue-gray
+          };
+        }
+      }
+
+      // Add worksheet to workbook
+      XLSX.utils.book_append_sheet(wb, ws, 'Sales Report');
+
+      // Write file
+      const fileName = monthFilter 
+        ? `Sales_Report_${monthFilter}.xlsx`
+        : `Sales_Report_${new Date().toISOString().split('T')[0]}.xlsx`;
+      
+      if (!XLSX.writeFile) {
+        throw new Error('XLSX.writeFile is not available');
+      }
+      
+      XLSX.writeFile(wb, fileName);
+      notify('Excel Export Started');
+      setIsExportModalOpen(false);
+      setExportMonth('');
+    } catch (error) {
+      console.error('Export error:', error);
+      console.error('Error details:', error instanceof Error ? error.message : String(error));
+      notify(`Export failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  };
+
+  const handleExportClick = () => {
+    setIsExportModalOpen(true);
+  };
+
+  const handleExportAll = () => {
+    exportCSV();
+  };
+
+  const handleExportByMonth = () => {
+    if (!exportMonth) {
+      notify('Please select a month');
+      return;
+    }
+    exportCSV(exportMonth);
   };
 
   return (
@@ -246,20 +503,31 @@ export default function App() {
           <h2 className="text-2xl font-bold capitalize">{view}</h2>
           <div className="flex gap-3">
             {view === 'history' && (
-              <button type="button" onClick={exportCSV} className="px-5 py-2.5 border border-slate-200 bg-white rounded-2xl font-bold text-sm flex items-center gap-2 hover:bg-slate-50">
+              <button type="button" onClick={handleExportClick} className="px-5 py-2.5 border border-slate-200 bg-white rounded-2xl font-bold text-sm flex items-center gap-2 hover:bg-slate-50">
                 <Download size={16} /> Export CSV
               </button>
             )}
-            <button type="button" onClick={() => setIsAddModalOpen(true)} className="px-5 py-2.5 bg-indigo-600 text-white rounded-2xl font-bold text-sm flex items-center gap-2 shadow-lg shadow-indigo-100 hover:bg-indigo-700">
-              <Plus size={16} /> Add Device
-            </button>
+            {view === 'inventory' && (
+              <button type="button" onClick={() => setIsAddModalOpen(true)} className="px-5 py-2.5 bg-indigo-600 text-white rounded-2xl font-bold text-sm flex items-center gap-2 shadow-lg shadow-indigo-100 hover:bg-indigo-700">
+                <Plus size={16} /> Add Device
+              </button>
+            )}
           </div>
         </header>
 
         <div className="p-8 max-w-7xl mx-auto">
-          {view === 'dashboard' && <Dashboard analytics={analytics} sales={sales} />}
+          {view === 'dashboard' && <Dashboard analytics={analytics} sales={sales} damages={damages} />}
           {view === 'inventory' && <Inventory products={products} setProducts={setProducts} />}
-          {view === 'payments' && <PaymentPortal products={products} onComplete={processSale} onNotify={notify} />}
+          {view === 'payments' && (
+            <PaymentPortal
+              products={products}
+              damages={damages}
+              onComplete={processSale}
+              onLogDamage={recordDamage}
+              onDeleteDamage={deleteDamage}
+              onNotify={notify}
+            />
+          )}
           {view === 'history' && (
             <HistoryTable
               sales={sales}
@@ -310,6 +578,56 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Export Options Modal */}
+      {isExportModalOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-slate-900/40 backdrop-blur-sm">
+          <div className="bg-white w-full max-w-md rounded-[2rem] shadow-2xl animate-in zoom-in-95 duration-200">
+            <div className="px-8 py-6 border-b flex justify-between items-center">
+              <h3 className="text-xl font-bold">Export Options</h3>
+              <button type="button" onClick={() => { setIsExportModalOpen(false); setExportMonth(''); }} className="p-2 hover:bg-slate-100 rounded-full"><X size={20} /></button>
+            </div>
+            <div className="p-8 space-y-6">
+              <div className="space-y-4">
+                <button
+                  type="button"
+                  onClick={handleExportAll}
+                  className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-bold hover:bg-indigo-700 transition-colors"
+                >
+                  Export All History
+                </button>
+                
+                <div className="relative">
+                  <div className="absolute inset-0 flex items-center">
+                    <div className="w-full border-t border-slate-200"></div>
+                  </div>
+                  <div className="relative flex justify-center text-sm">
+                    <span className="px-4 bg-white text-slate-500 font-bold uppercase">Or</span>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <label className="block text-sm font-bold text-slate-700">Export by Month</label>
+                  <input
+                    type="month"
+                    value={exportMonth}
+                    onChange={(e) => setExportMonth(e.target.value)}
+                    className="w-full px-5 py-3.5 bg-slate-50 border rounded-2xl outline-none focus:ring-2 focus:ring-indigo-500/20"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleExportByMonth}
+                    disabled={!exportMonth}
+                    className="w-full bg-slate-900 text-white py-4 rounded-2xl font-bold hover:bg-slate-800 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Export Selected Month
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -338,7 +656,16 @@ function NavItem({ icon: Icon, label, active, collapsed, onClick }: NavItemProps
   );
 }
 
-function Dashboard({ analytics, sales }: { analytics: any; sales: Sale[] }) {
+function Dashboard({ analytics, sales, damages }: { analytics: any; sales: Sale[]; damages: DamageRecord[] }) {
+  // Combine sales and damages, sort by timestamp (newest first)
+  const recentActivity = useMemo(() => {
+    const salesWithType = sales.map((s) => ({ ...s, type: 'sale' as const, displayName: s.customerName, displayAmount: s.paymentAmount }));
+    const damagesWithType = damages.map((d) => ({ ...d, type: 'damage' as const, displayName: d.productName, displayAmount: -(d.unitPrice * d.quantity) }));
+    return [...salesWithType, ...damagesWithType]
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 5);
+  }, [sales, damages]);
+
   return (
     <div className="space-y-8 animate-in fade-in duration-500">
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -351,19 +678,43 @@ function Dashboard({ analytics, sales }: { analytics: any; sales: Sale[] }) {
         <div className="bg-white p-8 rounded-[2rem] border border-slate-200">
           <h3 className="font-bold mb-6">Recent Activity</h3>
           <div className="space-y-4">
-            {sales.slice(0, 5).map((s: Sale) => (
-              <div key={s.id} className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl">
+            {recentActivity.map((item) => (
+              <div 
+                key={item.id} 
+                className={`flex items-center justify-between p-4 rounded-2xl ${
+                  item.type === 'sale' 
+                    ? 'bg-green-50 border border-green-100' 
+                    : 'bg-red-50 border border-red-100'
+                }`}
+              >
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center border border-slate-100"><User size={16} /></div>
+                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center border ${
+                    item.type === 'sale'
+                      ? 'bg-green-100 border-green-200'
+                      : 'bg-red-100 border-red-200'
+                  }`}>
+                    {item.type === 'sale' ? (
+                      <User size={16} className="text-green-700" />
+                    ) : (
+                      <Trash2 size={16} className="text-red-700" />
+                    )}
+                  </div>
                   <div>
-                    <p className="text-sm font-bold">{s.customerName}</p>
-                    <p className="text-[10px] text-slate-400 font-bold uppercase">{new Date(s.timestamp).toLocaleDateString()}</p>
+                    <p className="text-sm font-bold">{item.displayName}</p>
+                    <p className="text-[10px] text-slate-500 font-bold uppercase">
+                      {new Date(item.timestamp).toLocaleDateString()}
+                      {item.type === 'damage' && ` • ${(item as DamageRecord).type}`}
+                    </p>
                   </div>
                 </div>
-                <p className="font-black text-sm">{formatNaira(s.paymentAmount)}</p>
+                <p className={`font-black text-sm ${
+                  item.type === 'sale' ? 'text-green-700' : 'text-red-700'
+                }`}>
+                  {item.type === 'sale' ? '+' : ''}{formatNaira(Math.abs(item.displayAmount))}
+                </p>
               </div>
             ))}
-            {sales.length === 0 && <div className="text-center py-8 text-slate-400 text-sm">No transactions yet</div>}
+            {recentActivity.length === 0 && <div className="text-center py-8 text-slate-400 text-sm">No activity yet</div>}
           </div>
         </div>
         <div className="bg-white p-8 rounded-[2rem] border border-slate-200 flex flex-col items-center justify-center">
@@ -459,11 +810,32 @@ function Inventory({ products, setProducts }: { products: Product[]; setProducts
   );
 }
 
-function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]; onComplete: (s: Omit<Sale, 'id' | 'timestamp'>) => void; onNotify: (m: string) => void; }) {
+function PaymentPortal({
+  products,
+  damages,
+  onComplete,
+  onLogDamage,
+  onDeleteDamage,
+  onNotify
+}: {
+  products: Product[];
+  damages: DamageRecord[];
+  onComplete: (s: Omit<Sale, 'id' | 'timestamp'>) => void;
+  onLogDamage: (d: { productId: string; quantity: number; type: DamageRecord['type']; note?: string }) => void;
+  onDeleteDamage: (id: string) => void;
+  onNotify: (m: string) => void;
+}) {
   const [customer, setCustomer] = useState({ name: '', phone: '' });
   const [cart, setCart] = useState<Record<string, number>>({});
   const [receiptReceivedAt, setReceiptReceivedAt] = useState<string>('');
   const [amountPaid, setAmountPaid] = useState<string>('');
+  const [incompleteConfirm, setIncompleteConfirm] = useState<{ open: boolean; missing: string[] }>({ open: false, missing: [] });
+  const [damageForm, setDamageForm] = useState<{ productId: string; quantity: number; type: DamageRecord['type']; note: string }>({
+    productId: '',
+    quantity: 1,
+    type: 'Damaged',
+    note: ''
+  });
 
   const total = useMemo(() => {
     return Object.entries(cart).reduce((sum, [id, qty]) => {
@@ -490,21 +862,7 @@ function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]
     });
   };
 
-  const submit = () => {
-    if (!customer.name || total === 0) {
-      onNotify('Provide customer name and select items');
-      return;
-    }
-
-    const payment = Number(amountPaid);
-    if (!amountPaid || isNaN(payment) || payment <= 0) {
-      onNotify('Enter a valid amount paid');
-      return;
-    }
-    if (payment > total) {
-      onNotify('Amount paid cannot be more than total due');
-      return;
-    }
+  const finalizeSale = (payment: number) => {
     // Validate stock again
     const insufficient = Object.entries(cart).find(([id, qty]) => {
       const p = products.find((prod) => prod.id === id);
@@ -530,72 +888,248 @@ function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]
     setCustomer({ name: '', phone: '' });
     setAmountPaid('');
     setReceiptReceivedAt('');
+    setIncompleteConfirm({ open: false, missing: [] });
+  };
+
+  const submit = (overrideIncomplete = false) => {
+    const missing: string[] = [];
+    if (!customer.name) missing.push('Customer name');
+    if (!customer.phone) missing.push('Phone number');
+    if (!receiptReceivedAt) missing.push('Receipt collection date');
+    if (!amountPaid) missing.push('Amount paid');
+
+    if (missing.length > 0 && !overrideIncomplete) {
+      setIncompleteConfirm({ open: true, missing });
+      onNotify('Some transaction details are incomplete');
+      return;
+    }
+
+    if (total === 0) {
+      onNotify('Select at least one item');
+      return;
+    }
+
+    const payment = Number(amountPaid);
+    if (!amountPaid || isNaN(payment) || payment <= 0) {
+      onNotify('Enter a valid amount paid');
+      return;
+    }
+    if (payment > total) {
+      onNotify('Amount paid cannot be more than total due');
+      return;
+    }
+
+    finalizeSale(payment);
+  };
+
+  const logDamage = () => {
+    if (!damageForm.productId) {
+      onNotify('Select a product to log');
+      return;
+    }
+    if (damageForm.quantity <= 0) {
+      onNotify('Quantity must be greater than zero');
+      return;
+    }
+
+    onLogDamage({
+      productId: damageForm.productId,
+      quantity: damageForm.quantity,
+      type: damageForm.type,
+      note: damageForm.note
+    });
+    setDamageForm({ productId: '', quantity: 1, type: 'Damaged', note: '' });
   };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 animate-in slide-in-from-right-4">
-      <div className="lg:col-span-2 space-y-6">
-        <div className="bg-white p-8 rounded-[2rem] border border-slate-200">
-          <h3 className="font-bold mb-6">Select Devices</h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {products.map((p: Product) => (
-              <div key={p.id} className={`p-4 rounded-2xl border-2 transition-all ${cart[p.id] ? 'border-indigo-600 bg-indigo-50/30' : 'border-slate-100'}`}>
-                <div className="flex justify-between items-start mb-3">
-                  <div>
-                    <h4 className="font-bold text-sm truncate">{p.name}</h4>
-                    <p className="text-[10px] font-bold text-slate-400">{formatNaira(p.price)} • {p.stock} Left</p>
+    <>
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-8 animate-in slide-in-from-right-4">
+        <div className="lg:col-span-2 space-y-6">
+          <div className="bg-white p-8 rounded-[2rem] border border-slate-200">
+            <h3 className="font-bold mb-6">Select Devices</h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {products.map((p: Product) => (
+                <div key={p.id} className={`p-4 rounded-2xl border-2 transition-all ${cart[p.id] ? 'border-indigo-600 bg-indigo-50/30' : 'border-slate-100'}`}>
+                  <div className="flex justify-between items-start mb-3">
+                    <div>
+                      <h4 className="font-bold text-sm truncate">{p.name}</h4>
+                      <p className="text-[10px] font-bold text-slate-400">{formatNaira(p.price)} • {p.stock} Left</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <button type="button" onClick={() => updateCart(p.id, -1)} className="p-1.5 bg-white border border-slate-200 rounded-lg"><Minus size={12}/></button>
+                    <span className="flex-1 text-center font-bold text-sm">{cart[p.id] || 0}</span>
+                    <button type="button" onClick={() => updateCart(p.id, 1)} className="p-1.5 bg-indigo-600 text-white rounded-lg"><Plus size={12}/></button>
                   </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <button type="button" onClick={() => updateCart(p.id, -1)} className="p-1.5 bg-white border border-slate-200 rounded-lg"><Minus size={12}/></button>
-                  <span className="flex-1 text-center font-bold text-sm">{cart[p.id] || 0}</span>
-                  <button type="button" onClick={() => updateCart(p.id, 1)} className="p-1.5 bg-indigo-600 text-white rounded-lg"><Plus size={12}/></button>
-                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="lg:col-span-3 grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="bg-white p-8 rounded-[2rem] border border-slate-200 sticky top-28 shadow-sm">
+            <h3 className="font-bold mb-6">Transaction Detail</h3>
+            <div className="space-y-4">
+              <input value={customer.name} onChange={e => setCustomer({...customer, name: e.target.value})} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none" placeholder="Customer Name" />
+              <input value={customer.phone} onChange={e => setCustomer({...customer, phone: e.target.value})} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none" placeholder="Phone Number" />
+
+              <div className="space-y-2">
+                <label className="text-[11px] font-bold text-slate-500 uppercase">Receipt Collection Date</label>
+                <input
+                  type="date"
+                  value={receiptReceivedAt}
+                  onChange={e => setReceiptReceivedAt(e.target.value)}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none text-sm"
+                />
               </div>
-            ))}
+
+              <div className="space-y-2">
+                <label className="text-[11px] font-bold text-slate-500 uppercase">Amount Paid</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={amountPaid}
+                  onChange={e => setAmountPaid(e.target.value)}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+                  placeholder="Enter amount received"
+                />
+              </div>
+
+              <div className="pt-4 border-t border-slate-100 flex justify-between items-center">
+                <span className="text-xs font-bold text-slate-400 uppercase">Total Due</span>
+                <span className="text-xl font-black text-indigo-700">{formatNaira(total)}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => submit(false)}
+                className={`w-full bg-slate-900 text-white py-4 rounded-2xl font-bold shadow-lg shadow-slate-200 mt-4 ${total === 0 ? 'opacity-40 cursor-not-allowed' : ''}`}
+                aria-disabled={total === 0}
+              >
+                Complete Sale
+              </button>
+            </div>
           </div>
-        </div>
-      </div>
-      <div className="space-y-6">
-        <div className="bg-white p-8 rounded-[2rem] border border-slate-200 sticky top-28 shadow-sm">
-          <h3 className="font-bold mb-6">Transaction Detail</h3>
-          <div className="space-y-4">
-            <input value={customer.name} onChange={e => setCustomer({...customer, name: e.target.value})} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none" placeholder="Customer Name" />
-            <input value={customer.phone} onChange={e => setCustomer({...customer, phone: e.target.value})} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none" placeholder="Phone Number" />
 
-            <div className="space-y-2">
-              <label className="text-[11px] font-bold text-slate-500 uppercase">Receipt Collection Date</label>
-              <input
-                type="date"
-                value={receiptReceivedAt}
-                onChange={e => setReceiptReceivedAt(e.target.value)}
-                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none text-sm"
-              />
+          <div className="bg-white p-6 rounded-[1.5rem] border border-slate-200 shadow-sm space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold">Damages / Stolen</h3>
             </div>
-
-            <div className="space-y-2">
-              <label className="text-[11px] font-bold text-slate-500 uppercase">Amount Paid</label>
-              <input
-                type="number"
-                min={0}
-                value={amountPaid}
-                onChange={e => setAmountPaid(e.target.value)}
-                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
-                placeholder="Enter amount received"
-              />
+            <select
+              value={damageForm.productId}
+              onChange={(e) => setDamageForm((f) => ({ ...f, productId: e.target.value }))}
+              className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+            >
+              <option value="">Select product</option>
+              {products.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name} ({p.stock} left)
+                </option>
+              ))}
+            </select>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-2">
+                <label className="text-[11px] font-bold text-slate-500 uppercase">Quantity</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={damageForm.quantity}
+                  onChange={(e) => setDamageForm((f) => ({ ...f, quantity: Math.max(1, Number(e.target.value) || 1) }))}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+                />
+              </div>
+              <div className="flex flex-col gap-2">
+                <label className="text-[11px] font-bold text-slate-500 uppercase">Type</label>
+                <select
+                  value={damageForm.type}
+                  onChange={(e) => setDamageForm((f) => ({ ...f, type: e.target.value as DamageRecord['type'] }))}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+                >
+                  <option value="Damaged">Damaged</option>
+                  <option value="Stolen">Stolen</option>
+                </select>
+              </div>
             </div>
-
-            <div className="pt-4 border-t border-slate-100 flex justify-between items-center">
-              <span className="text-xs font-bold text-slate-400 uppercase">Total Due</span>
-              <span className="text-xl font-black text-indigo-700">{formatNaira(total)}</span>
-            </div>
-            <button type="button" onClick={submit} disabled={!customer.name || total === 0} className="w-full bg-slate-900 text-white py-4 rounded-2xl font-bold shadow-lg shadow-slate-200 disabled:opacity-20 mt-4">
-              Complete Sale
+            <input
+              value={damageForm.note}
+              onChange={(e) => setDamageForm((f) => ({ ...f, note: e.target.value }))}
+              className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+              placeholder="Notes (optional)"
+            />
+            <button
+              type="button"
+              onClick={logDamage}
+              className="w-full bg-rose-600 text-white py-3 rounded-xl font-bold shadow-md shadow-rose-100 hover:bg-rose-700 transition-colors"
+            >
+              Log damage / stolen
             </button>
+
+            <div className="pt-2 border-t border-slate-100 space-y-2">
+              <p className="text-[11px] font-bold text-slate-500 uppercase">Recent (3)</p>
+              {damages.slice(0, 3).map((d) => (
+                <div key={d.id} className="flex items-center justify-between text-sm bg-slate-50 border border-slate-100 rounded-xl px-3 py-2">
+                  <div className="flex-1">
+                    <p className="font-bold">{d.productName}</p>
+                    <p className="text-[11px] text-slate-500">{d.quantity} × {formatNaira(d.unitPrice)} • {d.type}</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-black text-rose-600">{formatNaira(d.unitPrice * d.quantity)}</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (confirm(`Delete this ${d.type.toLowerCase()} record for ${d.productName}? Stock will be restored.`)) {
+                          onDeleteDamage(d.id);
+                        }
+                      }}
+                      className="text-slate-300 hover:text-rose-500 hover:bg-rose-50 p-1.5 rounded transition-all"
+                      title="Delete record"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {damages.length === 0 && <p className="text-xs text-slate-400">No logged damages yet</p>}
+            </div>
           </div>
         </div>
       </div>
-    </div>
+
+      {incompleteConfirm.open && (
+        <div
+          className="fixed inset-0 z-[999] flex items-center justify-center p-6 bg-slate-900/40 backdrop-blur-sm"
+          aria-modal="true"
+          role="dialog"
+        >
+          <div className="bg-white w-full max-w-md rounded-[1.75rem] shadow-2xl p-8 animate-in zoom-in-95 duration-200">
+            <div className="flex justify-between items-start mb-4">
+              <div>
+                <h4 className="text-lg font-bold">Incomplete details</h4>
+                <p className="text-sm text-slate-500">Some fields are empty. Continue anyway?</p>
+              </div>
+              <button type="button" onClick={() => setIncompleteConfirm({ open: false, missing: [] })} className="p-2 hover:bg-slate-100 rounded-full">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="bg-slate-50 border border-slate-100 rounded-xl p-4 text-sm text-slate-600 mb-6">
+              <p className="font-bold text-xs text-slate-500 mb-2">Missing:</p>
+              <ul className="list-disc list-inside space-y-1">
+                {incompleteConfirm.missing.map((m) => (
+                  <li key={m}>{m}</li>
+                ))}
+              </ul>
+            </div>
+            <div className="flex gap-3">
+              <button type="button" onClick={() => setIncompleteConfirm({ open: false, missing: [] })} className="flex-1 border border-slate-200 text-slate-700 py-3 rounded-xl font-bold">
+                Cancel
+              </button>
+              <button type="button" onClick={() => submit(true)} className="flex-1 bg-slate-900 text-white py-3 rounded-xl font-bold">
+                Proceed anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

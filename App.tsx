@@ -53,6 +53,17 @@ interface Sale {
   timestamp: number;
 }
 
+interface DamageRecord {
+  id: string;
+  productId: string;
+  productName: string;
+  quantity: number;
+  unitPrice: number;
+  type: 'Damaged' | 'Stolen';
+  note?: string | undefined;
+  timestamp: number;
+}
+
 type IconType = React.ComponentType<any>;
 
 const CATEGORY_MAP: Record<DeviceCategory, { icon: IconType; color: string; hex: string }> = {
@@ -80,6 +91,8 @@ export default function App() {
   const [view, setView] = useState<'dashboard' | 'inventory' | 'payments' | 'history'>('dashboard');
   const [products, setProducts] = useState<Product[]>([]);
   const [sales, setSales] = useState<Sale[]>([]);
+  const [damages, setDamages] = useState<DamageRecord[]>([]);
+  const [hydrated, setHydrated] = useState(false);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [notification, setNotification] = useState<string | null>(null);
@@ -92,15 +105,18 @@ export default function App() {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed.products)) setProducts(parsed.products);
         if (Array.isArray(parsed.sales)) setSales(parsed.sales);
+        if (Array.isArray(parsed.damages)) setDamages(parsed.damages);
       } catch (e) {
         console.error('Failed to load local data', e);
       }
     }
+    setHydrated(true);
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ products, sales }));
-  }, [products, sales]);
+    if (!hydrated) return; // avoid overwriting saved data before hydration
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ products, sales, damages }));
+  }, [products, sales, damages, hydrated]);
 
   const notify = (msg: string) => {
     setNotification(msg);
@@ -109,7 +125,8 @@ export default function App() {
 
   // Analytics derived from state
   const analytics = useMemo(() => {
-    const totalRevenue = sales.reduce((acc, sale) => acc + sale.paymentAmount, 0);
+    const damageLoss = damages.reduce((acc, d) => acc + d.unitPrice * d.quantity, 0);
+    const totalRevenue = sales.reduce((acc, sale) => acc + sale.paymentAmount, 0) - damageLoss;
     const stockValue = products.reduce((acc, p) => acc + p.price * p.stock, 0);
 
     const categoryDistribution: Record<string, number> = {};
@@ -126,8 +143,8 @@ export default function App() {
       color: CATEGORY_MAP[(label as DeviceCategory)]?.hex || '#64748b'
     }));
 
-    return { totalRevenue, totalSales: sales.length, stockValue, chartData };
-  }, [sales, products]);
+    return { totalRevenue, totalSales: sales.length, stockValue, chartData, damageLoss };
+  }, [sales, products, damages]);
 
   // Actions
   const addProduct = (e: React.FormEvent<HTMLFormElement>) => {
@@ -175,6 +192,39 @@ export default function App() {
 
     setView('history');
     notify(`Transaction ${newSale.id} completed`);
+  };
+
+  const recordDamage = (payload: { productId: string; quantity: number; type: DamageRecord['type']; note?: string }) => {
+    const product = products.find((p) => p.id === payload.productId);
+    if (!product) {
+      notify('Product not found');
+      return;
+    }
+    if (payload.quantity <= 0) {
+      notify('Quantity must be greater than zero');
+      return;
+    }
+    if (product.stock < payload.quantity) {
+      notify('Cannot log more than available stock');
+      return;
+    }
+
+    const record: DamageRecord = {
+      id: `DMG-${Math.random().toString(36).substring(2, 9).toUpperCase()}`,
+      productId: product.id,
+      productName: product.name,
+      quantity: payload.quantity,
+      unitPrice: product.price,
+      type: payload.type,
+      note: payload.note?.trim() || undefined,
+      timestamp: Date.now()
+    };
+
+    setDamages((prev) => [record, ...prev]);
+    setProducts((prev) =>
+      prev.map((p) => (p.id === product.id ? { ...p, stock: Math.max(0, p.stock - payload.quantity) } : p))
+    );
+    notify(`${payload.type} logged for ${product.name}`);
   };
 
   const exportCSV = () => {
@@ -256,7 +306,15 @@ export default function App() {
         <div className="p-8 max-w-7xl mx-auto">
           {view === 'dashboard' && <Dashboard analytics={analytics} sales={sales} />}
           {view === 'inventory' && <Inventory products={products} setProducts={setProducts} />}
-          {view === 'payments' && <PaymentPortal products={products} onComplete={processSale} onNotify={notify} />}
+          {view === 'payments' && (
+            <PaymentPortal
+              products={products}
+              damages={damages}
+              onComplete={processSale}
+              onLogDamage={recordDamage}
+              onNotify={notify}
+            />
+          )}
           {view === 'history' && <HistoryTable sales={sales} />}
         </div>
       </main>
@@ -444,9 +502,28 @@ function Inventory({ products, setProducts }: { products: Product[]; setProducts
   );
 }
 
-function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]; onComplete: (s: Omit<Sale, 'id' | 'timestamp'>) => void; onNotify: (m: string) => void; }) {
+function PaymentPortal({
+  products,
+  damages,
+  onComplete,
+  onLogDamage,
+  onNotify
+}: {
+  products: Product[];
+  damages: DamageRecord[];
+  onComplete: (s: Omit<Sale, 'id' | 'timestamp'>) => void;
+  onLogDamage: (d: { productId: string; quantity: number; type: DamageRecord['type']; note?: string }) => void;
+  onNotify: (m: string) => void;
+}) {
   const [customer, setCustomer] = useState({ name: '', phone: '' });
   const [cart, setCart] = useState<Record<string, number>>({});
+  const [incompleteConfirm, setIncompleteConfirm] = useState<{ open: boolean; missing: string[] }>({ open: false, missing: [] });
+  const [damageForm, setDamageForm] = useState<{ productId: string; quantity: number; type: DamageRecord['type']; note: string }>({
+    productId: '',
+    quantity: 1,
+    type: 'Damaged',
+    note: ''
+  });
 
   const total = useMemo(() => {
     return Object.entries(cart).reduce((sum, [id, qty]) => {
@@ -473,11 +550,7 @@ function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]
     });
   };
 
-  const submit = () => {
-    if (!customer.name || total === 0) {
-      onNotify('Provide customer name and select items');
-      return;
-    }
+  const finalizeSale = () => {
     // Validate stock again
     const insufficient = Object.entries(cart).find(([id, qty]) => {
       const p = products.find((prod) => prod.id === id);
@@ -500,50 +573,202 @@ function PaymentPortal({ products, onComplete, onNotify }: { products: Product[]
     });
     setCart({});
     setCustomer({ name: '', phone: '' });
+    setIncompleteConfirm({ open: false, missing: [] });
+  };
+
+  const submit = (overrideIncomplete = false) => {
+    const missing: string[] = [];
+    if (!customer.name) missing.push('Customer name');
+    if (!customer.phone) missing.push('Phone number');
+
+    // Always surface missing details first
+    if (missing.length > 0 && !overrideIncomplete) {
+      setIncompleteConfirm({ open: true, missing });
+      onNotify('Customer details incomplete');
+      return;
+    }
+
+    if (total === 0) {
+      onNotify('Select at least one item');
+      return;
+    }
+
+    finalizeSale();
+  };
+
+  const logDamage = () => {
+    if (!damageForm.productId) {
+      onNotify('Select a product to log');
+      return;
+    }
+    if (damageForm.quantity <= 0) {
+      onNotify('Quantity must be greater than zero');
+      return;
+    }
+
+    onLogDamage({
+      productId: damageForm.productId,
+      quantity: damageForm.quantity,
+      type: damageForm.type,
+      note: damageForm.note
+    });
+    setDamageForm({ productId: '', quantity: 1, type: 'Damaged', note: '' });
   };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 animate-in slide-in-from-right-4">
-      <div className="lg:col-span-2 space-y-6">
-        <div className="bg-white p-8 rounded-[2rem] border border-slate-200">
-          <h3 className="font-bold mb-6">Select Devices</h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {products.map((p: Product) => (
-              <div key={p.id} className={`p-4 rounded-2xl border-2 transition-all ${cart[p.id] ? 'border-indigo-600 bg-indigo-50/30' : 'border-slate-100'}`}>
-                <div className="flex justify-between items-start mb-3">
-                  <div>
-                    <h4 className="font-bold text-sm truncate">{p.name}</h4>
-                    <p className="text-[10px] font-bold text-slate-400">{formatNaira(p.price)} • {p.stock} Left</p>
+    <>
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 animate-in slide-in-from-right-4">
+        <div className="lg:col-span-2 space-y-6">
+          <div className="bg-white p-8 rounded-[2rem] border border-slate-200">
+            <h3 className="font-bold mb-6">Select Devices</h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {products.map((p: Product) => (
+                <div key={p.id} className={`p-4 rounded-2xl border-2 transition-all ${cart[p.id] ? 'border-indigo-600 bg-indigo-50/30' : 'border-slate-100'}`}>
+                  <div className="flex justify-between items-start mb-3">
+                    <div>
+                      <h4 className="font-bold text-sm truncate">{p.name}</h4>
+                      <p className="text-[10px] font-bold text-slate-400">{formatNaira(p.price)} • {p.stock} Left</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <button type="button" onClick={() => updateCart(p.id, -1)} className="p-1.5 bg-white border border-slate-200 rounded-lg"><Minus size={12}/></button>
+                    <span className="flex-1 text-center font-bold text-sm">{cart[p.id] || 0}</span>
+                    <button type="button" onClick={() => updateCart(p.id, 1)} className="p-1.5 bg-indigo-600 text-white rounded-lg"><Plus size={12}/></button>
                   </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <button type="button" onClick={() => updateCart(p.id, -1)} className="p-1.5 bg-white border border-slate-200 rounded-lg"><Minus size={12}/></button>
-                  <span className="flex-1 text-center font-bold text-sm">{cart[p.id] || 0}</span>
-                  <button type="button" onClick={() => updateCart(p.id, 1)} className="p-1.5 bg-indigo-600 text-white rounded-lg"><Plus size={12}/></button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-      <div className="space-y-6">
-        <div className="bg-white p-8 rounded-[2rem] border border-slate-200 sticky top-28 shadow-sm">
-          <h3 className="font-bold mb-6">Transaction Detail</h3>
-          <div className="space-y-4">
-            <input value={customer.name} onChange={e => setCustomer({...customer, name: e.target.value})} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none" placeholder="Customer Name" />
-            <input value={customer.phone} onChange={e => setCustomer({...customer, phone: e.target.value})} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none" placeholder="Phone Number" />
-            
-            <div className="pt-4 border-t border-slate-100 flex justify-between items-center">
-              <span className="text-xs font-bold text-slate-400 uppercase">Total Due</span>
-              <span className="text-xl font-black text-indigo-700">{formatNaira(total)}</span>
+              ))}
             </div>
-            <button type="button" onClick={submit} disabled={!customer.name || total === 0} className="w-full bg-slate-900 text-white py-4 rounded-2xl font-bold shadow-lg shadow-slate-200 disabled:opacity-20 mt-4">
-              Complete Sale
+          </div>
+        </div>
+        <div className="space-y-6">
+          <div className="bg-white p-8 rounded-[2rem] border border-slate-200 sticky top-28 shadow-sm">
+            <h3 className="font-bold mb-6">Transaction Detail</h3>
+            <div className="space-y-4">
+              <input value={customer.name} onChange={e => setCustomer({...customer, name: e.target.value})} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none" placeholder="Customer Name" />
+              <input value={customer.phone} onChange={e => setCustomer({...customer, phone: e.target.value})} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none" placeholder="Phone Number" />
+              
+              <div className="pt-4 border-t border-slate-100 flex justify-between items-center">
+                <span className="text-xs font-bold text-slate-400 uppercase">Total Due</span>
+                <span className="text-xl font-black text-indigo-700">{formatNaira(total)}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => submit(false)}
+                className={`w-full bg-slate-900 text-white py-4 rounded-2xl font-bold shadow-lg shadow-slate-200 mt-4 ${total === 0 ? 'opacity-40 cursor-not-allowed' : ''}`}
+                aria-disabled={total === 0}
+              >
+                Complete Sale
+              </button>
+            </div>
+          </div>
+
+          <div className="bg-white p-6 rounded-[1.5rem] border border-slate-200 shadow-sm space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold">Damages / Stolen</h3>
+              <span className="text-[10px] font-black uppercase text-slate-400">Stock & revenue impact</span>
+            </div>
+            <select
+              value={damageForm.productId}
+              onChange={(e) => setDamageForm((f) => ({ ...f, productId: e.target.value }))}
+              className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+            >
+              <option value="">Select product</option>
+              {products.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name} ({p.stock} left)
+                </option>
+              ))}
+            </select>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-2">
+                <label className="text-[11px] font-bold text-slate-500 uppercase">Quantity</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={damageForm.quantity}
+                  onChange={(e) => setDamageForm((f) => ({ ...f, quantity: Math.max(1, Number(e.target.value) || 1) }))}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+                />
+              </div>
+              <div className="flex flex-col gap-2">
+                <label className="text-[11px] font-bold text-slate-500 uppercase">Type</label>
+                <select
+                  value={damageForm.type}
+                  onChange={(e) => setDamageForm((f) => ({ ...f, type: e.target.value as DamageRecord['type'] }))}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+                >
+                  <option value="Damaged">Damaged</option>
+                  <option value="Stolen">Stolen</option>
+                </select>
+              </div>
+            </div>
+            <input
+              value={damageForm.note}
+              onChange={(e) => setDamageForm((f) => ({ ...f, note: e.target.value }))}
+              className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
+              placeholder="Notes (optional)"
+            />
+            <button
+              type="button"
+              onClick={logDamage}
+              className="w-full bg-rose-600 text-white py-3 rounded-xl font-bold shadow-md shadow-rose-100 hover:bg-rose-700 transition-colors"
+            >
+              Log damage / stolen
             </button>
+
+            <div className="pt-2 border-t border-slate-100 space-y-2">
+              <p className="text-[11px] font-bold text-slate-500 uppercase">Recent (3)</p>
+              {damages.slice(0, 3).map((d) => (
+                <div key={d.id} className="flex items-center justify-between text-sm bg-slate-50 border border-slate-100 rounded-xl px-3 py-2">
+                  <div>
+                    <p className="font-bold">{d.productName}</p>
+                    <p className="text-[11px] text-slate-500">{d.quantity} × {formatNaira(d.unitPrice)} • {d.type}</p>
+                  </div>
+                  <span className="font-black text-rose-600">{formatNaira(d.unitPrice * d.quantity)}</span>
+                </div>
+              ))}
+              {damages.length === 0 && <p className="text-xs text-slate-400">No logged damages yet</p>}
+            </div>
           </div>
         </div>
       </div>
-    </div>
+
+      {incompleteConfirm.open && (
+        <div
+          className="fixed inset-0 z-[999] flex items-center justify-center p-6 bg-slate-900/40 backdrop-blur-sm"
+          aria-modal="true"
+          role="dialog"
+        >
+          <div className="bg-white w-full max-w-md rounded-[1.75rem] shadow-2xl p-8 animate-in zoom-in-95 duration-200">
+            <div className="flex justify-between items-start mb-4">
+              <div>
+                <h4 className="text-lg font-bold">Incomplete details</h4>
+                <p className="text-sm text-slate-500">Some fields are empty. Continue anyway?</p>
+              </div>
+              <button type="button" onClick={() => setIncompleteConfirm({ open: false, missing: [] })} className="p-2 hover:bg-slate-100 rounded-full">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="bg-slate-50 border border-slate-100 rounded-xl p-4 text-sm text-slate-600 mb-6">
+              <p className="font-bold text-xs text-slate-500 mb-2">Missing:</p>
+              <ul className="list-disc list-inside space-y-1">
+                {incompleteConfirm.missing.map((m) => (
+                  <li key={m}>{m}</li>
+                ))}
+              </ul>
+            </div>
+            <div className="flex gap-3">
+              <button type="button" onClick={() => setIncompleteConfirm({ open: false, missing: [] })} className="flex-1 border border-slate-200 text-slate-700 py-3 rounded-xl font-bold">
+                Cancel
+              </button>
+              <button type="button" onClick={() => submit(true)} className="flex-1 bg-slate-900 text-white py-3 rounded-xl font-bold">
+                Proceed anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
